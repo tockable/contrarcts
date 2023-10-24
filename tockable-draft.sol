@@ -34,7 +34,7 @@ contract TockDropNoWL is ERC721AQueryable, Ownable, ReentrancyGuard {
     /// Constants
     uint256 public constant TOTAL_SUPPLY = 10;
     uint256 private constant FIRST_TOKEN_ID = 1;
-    uint256 private constant BASE_FEE = 1_000_000_000_000_000_000;
+    uint256 private constant BASE_FEE = 0.0002 ether;
     string private constant TOKEN_NAME = "tockable";
     string private constant TOKEN_SYMBOL = "TCKBLE";
 
@@ -42,7 +42,7 @@ contract TockDropNoWL is ERC721AQueryable, Ownable, ReentrancyGuard {
     address private tockableAddress;
     address private signerAddress;
     uint256 public maxMintPerWallet = 2;
-    uint256 public PRICE = 2_000_000_000_000_000_000;
+    uint256 public PRICE = 0.007 ether;
     bool public mintIsLive = false;
 
     /// Mappings
