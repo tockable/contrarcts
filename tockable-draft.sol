@@ -16,8 +16,9 @@ contract TockDropNoWL is ERC721AQueryable, Ownable, ReentrancyGuard {
     error InvalidAmount();
     error InvalidArgs();
     error MintIsNotLive();
+    error MoreThanAllowed();
     error MoreThanAvailable();
-    error MoreThanMaxMintAllowed();
+    error NotElligible();
     error NotEnoughEth();
     error UnAuthorized();
     error WithdrawFailed();
@@ -34,7 +35,6 @@ contract TockDropNoWL is ERC721AQueryable, Ownable, ReentrancyGuard {
     /// Constants
     uint256 public constant TOTAL_SUPPLY = 10;
     uint256 private constant FIRST_TOKEN_ID = 1;
-    uint256 private constant BASE_FEE = 0.0002 ether;
     string private constant TOKEN_NAME = "tockable";
     string private constant TOKEN_SYMBOL = "TCKBLE";
 
@@ -42,23 +42,51 @@ contract TockDropNoWL is ERC721AQueryable, Ownable, ReentrancyGuard {
     address private tockableAddress;
     address private signerAddress;
     uint256 public maxMintPerWallet = 2;
-    uint256 public PRICE = 0.007 ether;
     bool public mintIsLive = false;
 
+    uint256 activeSession;
+
+    struct Role {
+        uint256 id;
+        uint256 price;
+        uint256 maxAllowedMint;
+    }
+
+    struct Session {
+        uint256 id;
+        uint256[] allowedRoles;
+        uint256 allocation;
+    }
+
     /// Mappings
+    mapping(uint256 => uint256) mintedInSessionById;
+    mapping(bytes32 => uint256) mintedBySignature;
+    mapping(uint256 => Role) getRoleById;
+    mapping(uint256 => Session) getSessionById;
     mapping(uint256 => IpfsHash) ipfsHashOf;
 
-    /// Owner setters
-    function setPrice(uint256 _price) external onlyOwner {
-        PRICE = _price;
+    function setRoles(Role[] calldata _roles) external onlyOwner {
+        unchecked {
+            for (uint256 i = 0; i < _roles.length; i++) {
+                getRoleById[i] = _roles[i];
+            }
+        }
+    }
+
+    function setSessions(Session[] calldata _session) external onlyOwner {
+        unchecked {
+            for (uint256 i = 0; i < _sessions.length; i++) {
+                getSessionById[i] = _sessions[i];
+            }
+        }
     }
 
     function setMintIsLive(bool _status) external onlyOwner {
         mintIsLive = _status;
     }
 
-    function setMaxMintPerWallet(uint256 _maxMintPerWallet) external onlyOwner {
-        maxMintPerWallet = _maxMintPerWallet;
+    function setActiveSession(uint256 _activeSession) external onlyOwner {
+        activeSession = _activeSession;
     }
 
     function getIpfsHashOf(
@@ -72,16 +100,18 @@ contract TockDropNoWL is ERC721AQueryable, Ownable, ReentrancyGuard {
         uint256 _quantity,
         IpfsHash[] calldata _cids,
         bytes32 _hash,
-        bytes calldata _signature
+        bytes calldata _signature,
+        uint256 _roleId
     ) external payable nonReentrant {
         if (!mintIsLive) revert MintIsNotLive();
-        if (_quantity > maxMintPerWallet) revert MoreThanMaxMintAllowed();
         if (_cids.length != _quantity) revert InvalidArgs();
 
-        isTokenLeft(_quantity);
+        isTokensLeftInTotal(_quantity);
+        isTokensLeftInActiveSession(_quantity);
         isSignatureValid(_hash, _signature);
+        isSignatureAllowedToMint(_signature);
 
-        uint256 payAmount = (PRICE + BASE_FEE) * _quantity;
+        uint256 payAmount = (getRoleById[_roleId].price + BASE_FEE) * _quantity;
         if (msg.value < payAmount) revert NotEnoughEth();
 
         uint256 nextTokenId = _nextTokenId();
@@ -92,22 +122,65 @@ contract TockDropNoWL is ERC721AQueryable, Ownable, ReentrancyGuard {
 
         _safeMint(msg.sender, _quantity);
 
+        mintedInSessionById[activeSession] =
+            mintedInSessionById[activeSession] +
+            _quantity;
+
+        mintedBySignature[_signature] =
+            mintedBySignature[_signature] +
+            _quantity;
+
         uint256 tockableFee = _quantity * BASE_FEE;
         withdrawEth(payable(tockableAddress), tockableFee);
     }
 
     function ownerMint(address _to, uint256 _quantity) external onlyOwner {
-        isTokenLeft(_quantity);
+        isTokensLeftInTotal(_quantity);
         _safeMint(_to, _quantity);
     }
 
-    /// Helpers
+    /// Validators
+    function isTokenLeftInTotal(uint256 _quantity) private view {
+        if (tokensLeft() < _quantity) revert MoreThanAvailable();
+    }
+
+    function isTolenLeftInActiveSession(uint256 _quantity) private view {
+        if (tokensLeftInSession(activeSession) < _quantity)
+            revert MoreThanAvailable();
+    }
+
+    function isSignatureAllowedToMint(bytes32 _signature) private view {
+        if (
+            mintedBySignature[_signature] + _quantity >
+            getRoleById[_roleId].maxMintAllowed
+        ) {
+            revert MoreThanAllowed();
+        }
+    }
+
+    function isSignatureValid(
+        bytes32 _hash,
+        bytes memory _signature
+    ) private view {
+        if (recoverSigner(_hash, _signature) != signerAddress)
+            revert UnAuthorized();
+    }
+
+    function isElligible(uint256 _roleId) private {
+        uint256 allowedRolesIdsInCurrentSession = getSessionById[activeSession]
+            .allowedRoles;
+        if (!isInArray(allowedRolesIdsInCurrentSession, _roleId)) {
+            revert NotElligible();
+        }
+    }
+
+    /// Helpers & Utils
     function tokensLeft() public view returns (uint256) {
         return TOTAL_SUPPLY - _totalMinted();
     }
 
-    function isTokenLeft(uint256 _quantity) private view {
-        if (tokensLeft() < _quantity) revert MoreThanAvailable();
+    function tokensLeftInSession(_id) public view returns (uint256) {
+        return getSessionById[_id].allocation - mintedInSessionById[_id];
     }
 
     function setIpfsHash(
@@ -129,13 +202,6 @@ contract TockDropNoWL is ERC721AQueryable, Ownable, ReentrancyGuard {
         return output;
     }
 
-    function isSignatureValid(
-        bytes32 _hash,
-        bytes memory _signature
-    ) private view {
-        if (recoverSigner(_hash, _signature) != signerAddress) revert UnAuthorized();
-    }
-
     function recoverSigner(
         bytes32 _hash,
         bytes memory _signature
@@ -144,6 +210,15 @@ contract TockDropNoWL is ERC721AQueryable, Ownable, ReentrancyGuard {
             abi.encodePacked("\x19Ethereum Signed Message:\n32", _hash)
         );
         return ECDSA.recover(messageDigest, _signature);
+    }
+
+    function isInArray(
+        uint256[] storage array,
+        uint256 value
+    ) private view returns (bool) {
+        uint256 len = array.length;
+        for (uint i = 0; i < len; i++) if (array[i] == value) return true;
+        return false;
     }
 
     /// Metadata
