@@ -35,6 +35,7 @@ contract TockDropNoWL is ERC721AQueryable, Ownable, ReentrancyGuard {
     /// Constants
     uint256 public constant TOTAL_SUPPLY = 10;
     uint256 private constant FIRST_TOKEN_ID = 1;
+    uint256 private constant BASE_FEE = 0.0002 ether;
     string private constant TOKEN_NAME = "tockable";
     string private constant TOKEN_SYMBOL = "TCKBLE";
 
