@@ -42,7 +42,6 @@ contract TockDropNoWL is ERC721AQueryable, Ownable, ReentrancyGuard {
     /// Parameters
     address private tockableAddress;
     address private signerAddress;
-    uint256 public maxMintPerWallet = 2;
     bool public mintIsLive = false;
 
     uint256 activeSession;
@@ -87,6 +86,7 @@ contract TockDropNoWL is ERC721AQueryable, Ownable, ReentrancyGuard {
     }
 
     function setActiveSession(uint256 _activeSession) external onlyOwner {
+        if (!mintIsLive) setMintIsLive(true);
         activeSession = _activeSession;
     }
 
