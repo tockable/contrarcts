@@ -8,8 +8,12 @@ import "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
 import "erc721a/contracts/extensions/ERC721AQueryable.sol";
 
 contract TockableDrop is ERC721AQueryable, Ownable, ReentrancyGuard {
+    /// contract version
+    uint256 public constant TOCKABLE_CONTRACT_VERSION = 1;
+
     /// Errors
     error InvalidArgs();
+    error NotInitialazed();
     error MintIsNotLive();
     error MoreThanAllowed();
     error MoreThanAvailable();
@@ -17,21 +21,13 @@ contract TockableDrop is ERC721AQueryable, Ownable, ReentrancyGuard {
     error NotEnoughEth();
     error UnAuthorized();
     error WithdrawFailed();
-    error TritsIsFrozen();
-    error IsTakenBefore();
-
-    /// Events
-    event ethReceived(address, uint256);
+    error TraitsIsFrozen();
+    error TokenHasBeenTakenBefore(uint256[] indexes);
 
     /// Structs
     struct IpfsHash {
         bytes32 part1;
         bytes32 part2;
-    }
-
-    struct Trait {
-        bytes32 trait_type;
-        bytes32 value;
     }
 
     struct Role {
@@ -62,34 +58,53 @@ contract TockableDrop is ERC721AQueryable, Ownable, ReentrancyGuard {
     address private signerAddress;
     bool public isMintLive = false;
     bool public isTraitsFrozen = false;
-    uint256 activeSession;
+    uint256 public activeSession;
+    uint256 private existingRolesLength;
+    uint256 private exisitngSessionsLength;
 
     /// Mappings
-    mapping(uint256 => uint256) mintedInSessionById;
-    mapping(bytes => uint256) mintedBySignature;
-    mapping(uint256 => Role) getRoleById;
-    mapping(uint256 => Session) getSessionById;
-    mapping(uint256 => IpfsHash) ipfsHashOf;
-    mapping(uint256 => mapping(bytes32 => bytes32)) traitValueOfTraitTypeOf;
-    mapping(bytes32 => bool) isTaken;
+    mapping(uint256 => uint256) private mintedInSessionById;
+    mapping(address => mapping(uint256 => mapping(uint256 => uint256)))
+        private mintedByAddressInRoleInSessionId;
+    mapping(uint256 => Role) private getRoleById;
+    mapping(uint256 => Session) private getSessionById;
+
+    mapping(uint256 => IpfsHash) private ipfsHashOf;
+    mapping(uint256 => mapping(bytes32 => bytes32))
+        private traitValueOfTraitTypeOf;
+    mapping(bytes32 => bool) private hasBeenTaken;
 
     /// setters
     function setRoles(Role[] calldata _roles) external onlyOwner {
         if (_roles.length == 0) revert InvalidArgs();
+        if (existingRolesLength > 0) {
+            if (_roles.length < existingRolesLength) revert InvalidArgs();
+        }
+
         unchecked {
             for (uint256 i = 0; i < _roles.length; i++) {
                 getRoleById[i] = _roles[i];
             }
         }
+
+        if (existingRolesLength < _roles.length)
+            existingRolesLength = _roles.length;
     }
 
     function setSessions(Session[] calldata _sessions) external onlyOwner {
         if (_sessions.length == 0) revert InvalidArgs();
+        if (exisitngSessionsLength > 0) {
+            if (_sessions.length < exisitngSessionsLength) revert InvalidArgs();
+        }
+
         unchecked {
             for (uint256 i = 0; i < _sessions.length; i++) {
                 getSessionById[i] = _sessions[i];
             }
         }
+
+        if (exisitngSessionsLength < _sessions.length)
+            exisitngSessionsLength = _sessions.length;
     }
 
     function setMintIsLive(bool _status) public onlyOwner {
@@ -102,11 +117,17 @@ contract TockableDrop is ERC721AQueryable, Ownable, ReentrancyGuard {
     }
 
     function addTraitTypes(bytes32[] calldata _traitTypes) external onlyOwner {
-        if (isTraitsFrozen) revert TritsIsFrozen();
+        if (isTraitsFrozen) revert TraitsIsFrozen();
+
         for (uint256 i = 0; i < _traitTypes.length; i++) {
             traitTypes.push(_traitTypes[i]);
         }
+
         isTraitsFrozen = true;
+    }
+
+    function _startTokenId() internal view virtual override returns (uint256) {
+        return FIRST_TOKEN_ID;
     }
 
     /// Mint
@@ -115,60 +136,56 @@ contract TockableDrop is ERC721AQueryable, Ownable, ReentrancyGuard {
         IpfsHash[] calldata _cids,
         bytes calldata _signature,
         uint256 _roleId,
-        Trait[][] calldata _traits
+        bytes32[][] calldata _traits
     ) external payable nonReentrant {
+        if (traitTypes.length == 0) revert NotInitialazed();
         if (!isMintLive) revert MintIsNotLive();
-        if (_cids.length != _quantity) revert InvalidArgs();
-        if (_cids.length != _traits.length) revert InvalidArgs();
-        if (_traits.length != traitTypes.length) revert InvalidArgs();
 
-        isTokenLeftInTotal(_quantity);
-        isTokenLeftInActiveSession(_quantity);
+        inMintArgsValid(_quantity, _cids, _traits);
         isElligible(_roleId);
         isSignatureValid(msg.sender, _roleId, _signature);
-        isSignatureHasQuota(_signature, _roleId, _quantity);
-
-        if (duplicateVerification) {
-            unchecked {
-                for (uint256 i = 0; i < _traits.length; i++) {
-                    bytes32 tokenHash = createHashFromTraits(_traits[i]);
-                    if (isTaken[tokenHash]) revert IsTakenBefore();
-                    isTaken[tokenHash] = true;
-                }
-            }
-        }
+        isTokenLeftInTotal(_quantity);
+        isTokenLeftInActiveSession(_quantity);
+        isTokenLeftForAddressInRoleInSession(msg.sender, _roleId, _quantity);
+        isDuplicate(_traits);
 
         uint256 payAmount = (getRoleById[_roleId].price + BASE_FEE) * _quantity;
         if (msg.value < payAmount) revert NotEnoughEth();
 
-        uint256 nextTokenId = _nextTokenId();
-        unchecked {
-            for (uint256 i = 0; i < _quantity; i++) {
-                setIpfsHash(nextTokenId + i, _cids[i]);
-                for (uint256 j = 0; j < _traits[i].length; j++) {
-                    traitValueOfTraitTypeOf[nextTokenId + i][
-                        _traits[i][j].trait_type
-                    ] = _traits[i][j].value;
-                }
-            }
-        }
+        uint256 nextTokenIdBeforeMint = _nextTokenId();
+
         _safeMint(msg.sender, _quantity);
+
+        setTokenTraits(_quantity, nextTokenIdBeforeMint, _cids, _traits);
 
         mintedInSessionById[activeSession] =
             mintedInSessionById[activeSession] +
             _quantity;
 
-        mintedBySignature[_signature] =
-            mintedBySignature[_signature] +
+        mintedByAddressInRoleInSessionId[msg.sender][_roleId][activeSession] =
+            mintedByAddressInRoleInSessionId[msg.sender][_roleId][
+                activeSession
+            ] +
             _quantity;
 
         uint256 tockableFee = _quantity * BASE_FEE;
         withdrawEth(payable(tockableAddress), tockableFee);
     }
 
-    function ownerMint(address _to, uint256 _quantity) external onlyOwner {
+    function ownerMint(
+        uint256 _quantity,
+        IpfsHash[] calldata _cids,
+        bytes32[][] calldata _traits
+    ) external nonReentrant onlyOwner {
+        if (traitTypes.length == 0) revert NotInitialazed();
+
+        inMintArgsValid(_quantity, _cids, _traits);
         isTokenLeftInTotal(_quantity);
-        _safeMint(_to, _quantity);
+        isDuplicate(_traits);
+
+        uint256 nextTokenIdBeforeMint = _nextTokenId();
+        _safeMint(msg.sender, _quantity);
+        setTokenTraits(_quantity, nextTokenIdBeforeMint, _cids, _traits);
     }
 
     /// Validators
@@ -185,17 +202,15 @@ contract TockableDrop is ERC721AQueryable, Ownable, ReentrancyGuard {
         }
     }
 
-    function isSignatureHasQuota(
-        bytes memory _signature,
+    function isTokenLeftForAddressInRoleInSession(
+        address _address,
         uint256 _roleId,
         uint256 _quantity
     ) private view {
         if (
-            mintedBySignature[_signature] + _quantity >
-            getRoleById[_roleId].maxAllowedMint
-        ) {
-            revert MoreThanAllowed();
-        }
+            tokensLeftForAddressInRoleInActiveSession(_address, _roleId) <
+            _quantity
+        ) revert MoreThanAllowed();
     }
 
     function isSignatureValid(
@@ -208,11 +223,41 @@ contract TockableDrop is ERC721AQueryable, Ownable, ReentrancyGuard {
     }
 
     function isElligible(uint256 _roleId) private view {
-        uint256[] storage allowedRolesIdsInCurrentSession = getSessionById[
+        uint256[] memory allowedRolesIdsInCurrentSession = getSessionById[
             activeSession
         ].allowedRoles;
-        if (!isInArray(allowedRolesIdsInCurrentSession, _roleId)) {
+        if (!isInArray(allowedRolesIdsInCurrentSession, _roleId))
             revert NotElligible();
+    }
+
+    function inMintArgsValid(
+        uint256 _quantity,
+        IpfsHash[] calldata _cids,
+        bytes32[][] calldata _traits
+    ) private pure {
+        if (_traits.length == 0) revert InvalidArgs();
+        if (_cids.length != _quantity) revert InvalidArgs();
+        if (_cids.length != _traits.length) revert InvalidArgs();
+    }
+
+    function isDuplicate(bytes32[][] calldata _traits) private {
+        if (!duplicateVerification) return;
+        uint256[] memory indexes = new uint256[](_traits.length);
+
+        unchecked {
+            for (uint256 i = 0; i < _traits.length; i++) {
+                bytes32 tokenHash = createHashFromTraits(_traits[i]);
+                if (hasBeenTaken[tokenHash]) {
+                    indexes[i] = 1;
+                } else {
+                    indexes[i] = 0;
+                    hasBeenTaken[tokenHash] = true;
+                }
+            }
+        }
+
+        if (isInArray(indexes, 1)) {
+            revert TokenHasBeenTakenBefore({indexes: indexes});
         }
     }
 
@@ -229,12 +274,29 @@ contract TockableDrop is ERC721AQueryable, Ownable, ReentrancyGuard {
                 '", '
             )
         );
+
         metadata = string(
-            abi.encodePacked('"image": "', getTokenImageIpfsUrl(tokenId), '", ')
+            abi.encodePacked(
+                metadata,
+                '"image": "',
+                getTokenImageIpfsUrl(tokenId),
+                '", '
+            )
         );
+
         metadata = string(
-            abi.encodePacked('"attributes": ', getTokenAttributes(tokenId), "}")
+            abi.encodePacked(metadata, '"symbol": "', TOKEN_SYMBOL, '", ')
         );
+
+        metadata = string(
+            abi.encodePacked(
+                metadata,
+                '"attributes": ',
+                getTokenAttributes(tokenId),
+                "}"
+            )
+        );
+
         return metadata;
     }
 
@@ -269,9 +331,7 @@ contract TockableDrop is ERC721AQueryable, Ownable, ReentrancyGuard {
         if (!ow) revert WithdrawFailed();
     }
 
-    receive() external payable {
-        emit ethReceived(msg.sender, msg.value);
-    }
+    receive() external payable {}
 
     /// Helpers & Utils
     function tokensLeft() public view returns (uint256) {
@@ -282,11 +342,42 @@ contract TockableDrop is ERC721AQueryable, Ownable, ReentrancyGuard {
         return getSessionById[_id].allocation - mintedInSessionById[_id];
     }
 
+    function tokensLeftForAddressInRoleInActiveSession(
+        address _address,
+        uint256 _roleId
+    ) private view returns (uint256) {
+        uint256 minted = mintedByAddressInRoleInSessionId[_address][_roleId][
+            activeSession
+        ];
+        uint256 maxMintable = getRoleById[_roleId].maxAllowedMint;
+        return maxMintable - minted;
+    }
+
     function setIpfsHash(
         uint256 _tokenId,
         IpfsHash calldata _ipfsHash
     ) private {
         ipfsHashOf[_tokenId] = _ipfsHash;
+    }
+
+    function setTokenTraits(
+        uint256 _quantity,
+        uint256 _nextTokenIdBeforeMint,
+        IpfsHash[] calldata _cids,
+        bytes32[][] calldata _traits
+    ) private {
+        unchecked {
+            for (uint256 i = 0; i < _quantity; i++) {
+                setIpfsHash(_nextTokenIdBeforeMint + i, _cids[i]);
+                for (uint256 j = 0; j < _traits[i].length; j++) {
+                    if (_traits[i].length != traitTypes.length)
+                        revert InvalidArgs();
+                    traitValueOfTraitTypeOf[_nextTokenIdBeforeMint + i][
+                        traitTypes[j]
+                    ] = _traits[i][j];
+                }
+            }
+        }
     }
 
     function getIpfsHashOf(
@@ -329,18 +420,18 @@ contract TockableDrop is ERC721AQueryable, Ownable, ReentrancyGuard {
     }
 
     function createHashFromTraits(
-        Trait[] calldata _traits
-    ) private pure returns (bytes32) {
+        bytes32[] calldata _traits
+    ) private view returns (bytes32) {
         string memory attributes = "";
+        if (_traits.length == 0) revert InvalidArgs();
+        if (_traits.length != traitTypes.length) revert InvalidArgs();
 
-        for (uint256 i = 0; i < _traits.length; i++) {
-            attributes = string(
-                abi.encodePacked(
-                    attributes,
-                    _traits[i].trait_type,
-                    _traits[i].value
-                )
-            );
+        unchecked {
+            for (uint256 i = 0; i < _traits.length; i++) {
+                attributes = string(
+                    abi.encodePacked(attributes, traitTypes[i], _traits[i])
+                );
+            }
         }
         bytes32 hash = keccak256(abi.encodePacked(attributes));
         return hash;
@@ -350,6 +441,7 @@ contract TockableDrop is ERC721AQueryable, Ownable, ReentrancyGuard {
         uint256 _tokenId
     ) public view returns (string memory) {
         string memory attributes = "[";
+
         for (uint256 i = 0; i < traitTypes.length - 1; i++) {
             attributes = string(
                 abi.encodePacked(
@@ -362,6 +454,7 @@ contract TockableDrop is ERC721AQueryable, Ownable, ReentrancyGuard {
                 )
             );
         }
+
         attributes = string(
             abi.encodePacked(
                 attributes,
@@ -374,13 +467,60 @@ contract TockableDrop is ERC721AQueryable, Ownable, ReentrancyGuard {
                 '"}]'
             )
         );
+
         return attributes;
     }
 
+    function getContractData()
+        external
+        view
+        returns (
+            string memory,
+            string memory,
+            string memory,
+            uint256,
+            bool,
+            bool,
+            bool,
+            bool,
+            bytes32[] memory
+        )
+    {
+        return (
+            CONTRACT_NAME,
+            TOKEN_NAME,
+            TOKEN_SYMBOL,
+            TOTAL_SUPPLY,
+            isMintLive,
+            duplicateVerification,
+            isUnlimited,
+            isTraitsFrozen,
+            traitTypes
+        );
+    }
+
+    function getSupplyData(
+        address _address,
+        uint256 _roleId
+    ) external view returns (uint256, uint256, uint256) {
+        uint256 tokensLeftInTotal = tokensLeft();
+        uint256 tokensLeftInActiveSession = tokensLeftInSession(activeSession);
+        uint256 tokensLeftForAddress = tokensLeftForAddressInRoleInActiveSession(
+                _address,
+                _roleId
+            );
+
+        return (
+            tokensLeftInTotal,
+            tokensLeftInActiveSession,
+            tokensLeftForAddress
+        );
+    }
+
     function isInArray(
-        uint256[] storage _arr,
+        uint256[] memory _arr,
         uint256 _val
-    ) private view returns (bool) {
+    ) private pure returns (bool) {
         uint256 len = _arr.length;
         for (uint256 i = 0; i < len; i++) if (_arr[i] == _val) return true;
         return false;
